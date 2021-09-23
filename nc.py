@@ -21,13 +21,33 @@ def get_parser():
     parser.add_argument(
         '--model',
         type=str,
-        default="facebook/wav2vec2-base-960h",
+        default="facebook/wav2vec2-large-960h",
         help="pre-trained model")
     parser.add_argument(
         'output',
         type=str,
         help="output file")
     return parser
+
+
+def plot_angle(feature_means, weights, ids_sorted):
+    cos = torch.nn.CosineSimilarity()
+    feature_angles = list()
+    weight_angles = list()
+
+    num_feature_means = feature_means.shape[0]
+    print(num_feature_means)
+    assert num_feature_means == len(ids_sorted)
+
+    for i in range(num_feature_means - 1):
+        for j in range(i + 1, num_feature_means):
+            feature_angle = cos(feature_means[i].unsqueeze(dim=0),
+                                feature_means[j].unsqueeze(dim=0))
+            feature_angles.append(feature_angle.item())
+            weight_angle = cos(weights[ids_sorted[i]].unsqueeze(dim=0),
+                               weights[ids_sorted[j]].unsqueeze(dim=0))
+            weight_angles.append(weight_angle.item())
+
 
 
 def analysis(features, class_boundary):
@@ -41,7 +61,7 @@ def analysis(features, class_boundary):
     assert num_features == last_boundary
 
     intra_feature_means = list()
-    for start, end in class_boundary:
+    for _, start, end in class_boundary:
         intra_feature_mean = features[start:end].mean(dim=0)
         intra_feature_means.append(intra_feature_mean)
         # here we substract the mean inplace
@@ -66,6 +86,7 @@ def analysis(features, class_boundary):
     result = torch.trace(lstsq(inter_covariance_matrix,
                                intra_covariance_matrix).solution) / num_classes
     print(result)
+    return intra_feature_means
 
 
 def main():
@@ -82,20 +103,29 @@ def main():
     model = Wav2Vec2Model.from_pretrained(pretrained_model)
     ctc_model = Wav2Vec2ForCTC.from_pretrained(pretrained_model)
 
-    librispeech_samples_ds = load_dataset(data, "clean", split="validation")
-    audio_input, sample_rate = sf.read(librispeech_samples_ds[0]["file"])
+    def map_to_array(batch):
+        speech, _ = sf.read(batch["file"])
+        batch["speech"] = speech
+        return batch
 
-    input_values = processor(audio_input, sampling_rate=sample_rate,
+    librispeech_ds = load_dataset(data, "clean", split="validation")
+    librispeech_ds = librispeech_ds.map(map_to_array)
+
+    input_values = processor(librispeech_ds["speech"], sampling_rate=16000,
                              return_tensors="pt").input_values
 
     # get feature
     model_output = model(input_values, output_hidden_states=True)
     features = model_output.extract_features.squeeze()
     last_hidden_states = model_output.last_hidden_state.squeeze()
+    print(features.shape)
+    print(last_hidden_states.shape)
 
     # get label
     logits = ctc_model(input_values).logits
+    print(logits.shape)
     predicted_ids = torch.argmax(logits, dim=-1).squeeze()
+    print(processor.decode(predicted_ids))
 
     num_features, feature_size = last_hidden_states.shape
     num_ids = predicted_ids.shape[0]
@@ -106,27 +136,43 @@ def main():
     class_boundary = list()
 
     start = 0
+    ids_sorted = list()
     for i in range(num_features):
         id = predicted_ids[i].item()
         if id != 0:
             context_features_dict[id].append(last_hidden_states[i])
+            if id not in ids_sorted:
+                ids_sorted.append(id)
+    ids_sorted.sort()
 
-    for _, context_feature in context_features_dict.items():
+    for id in ids_sorted:
+        context_feature = context_features_dict[id]
         context_features += context_feature
-        class_boundary.append((start, start + len(context_feature)))
+        class_boundary.append((id, start, start + len(context_feature)))
         start += len(context_feature)
 
-#    a_0 = torch.tensor([0.9, 1.0, 1.1])
-#    a_1 = torch.tensor([0.8, 1.1, 0.9])
-#    b_0 = torch.tensor([11, 10, 9])
-#    b_1 = torch.tensor([12, 11, 12])
-#    b_2 = torch.tensor([13, 10, 9])
-#    c_0 = torch.tensor([100, 110, 95])
-#    c_1 = torch.tensor([98, 99, 102])
+        # simple test
+        #    a_0 = torch.tensor([0.9, 1.0, 1.1])
+        #    a_1 = torch.tensor([0.8, 1.1, 0.9])
+        #    b_0 = torch.tensor([11, 10, 9])
+        #    b_1 = torch.tensor([12, 11, 12])
+        #    b_2 = torch.tensor([13, 10, 9])
+        #    c_0 = torch.tensor([100, 110, 95])
+        #    c_1 = torch.tensor([98, 99, 102])
+        #    context_features = [a_0, a_1, b_0, b_1, b_2, c_0, c_1]
+        #    class_boundary = [(0,2), (2,5), (5,7)]
 
-    #    context_features = [a_0, a_1, b_0, b_1, b_2, c_0, c_1]
-    #    class_boundary = [(0,2), (2,5), (5,7)]
-    analysis(context_features, class_boundary)
+    intra_feature_means = analysis(context_features, class_boundary)
+
+    num_intra_feature_means = intra_feature_means.shape[0]
+    num_classes = len(class_boundary)
+    assert num_intra_feature_means == num_classes
+
+    for w in ctc_model.lm_head.parameters():
+        weights = w
+        break
+
+    plot_angle(intra_feature_means, weights, ids_sorted)
 
 
 if __name__ == "__main__":
