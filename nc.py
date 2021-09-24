@@ -5,6 +5,8 @@
 import argparse
 import soundfile as sf
 import torch
+import numpy as np
+import matplotlib.pyplot as plt
 from collections import defaultdict
 from datasets import load_dataset
 from torch.linalg import lstsq
@@ -16,7 +18,7 @@ def get_parser():
     parser.add_argument(
         '--data',
         type=str,
-        default="patrickvonplaten/librispeech_asr_dummy",
+        default="dgao/librispeech_nc_test",
         help="audio data")
     parser.add_argument(
         '--model',
@@ -48,6 +50,19 @@ def plot_angle(feature_means, weights, ids_sorted):
                                weights[ids_sorted[j]].unsqueeze(dim=0))
             weight_angles.append(weight_angle.item())
 
+    # plot
+    feature_angles = np.array(feature_angles)
+    weight_angles = np.array(weight_angles)
+
+    c = feature_angles ** 2 + weight_angles ** 2
+    fig, ax = plt.subplots()
+    ax.scatter(feature_angles, weight_angles, s=5, c=c, cmap=plt.cm.coolwarm, zorder=10)
+    lims = [
+        np.min([ax.get_xlim(), ax.get_ylim()]),  # min of both axes
+        np.max([ax.get_xlim(), ax.get_ylim()]),  # max of both axes
+    ]
+    ax.plot(lims, lims, 'k-', alpha=0.75, zorder=0)
+    fig.savefig("librispeech.png")
 
 
 def analysis(features, class_boundary):
@@ -78,7 +93,8 @@ def analysis(features, class_boundary):
 
     inter_covariance_matrix = torch.zeros(feature_size, feature_size)
     for i in range(num_classes):
-        cur_vector_mean = (intra_feature_mean[i] - global_feature_mean).unsqueeze(1)
+        # unsqueeze for torch.matmul()
+        cur_vector_mean = (intra_feature_means[i] - global_feature_mean).unsqueeze(1)
         cur_covariance = torch.matmul(cur_vector_mean, cur_vector_mean.T)
         inter_covariance_matrix += cur_covariance
     inter_covariance_matrix /= num_classes
@@ -91,6 +107,7 @@ def analysis(features, class_boundary):
 
 def main():
     args = get_parser().parse_args()
+    device = torch.device("cpu")
 
     data = args.data
     pretrained_model = args.model
@@ -108,24 +125,35 @@ def main():
         batch["speech"] = speech
         return batch
 
+    def map_to_result(batch):
+        model.to(device)
+        ctc_model.to(device)
+
+        input_values = processor(batch["speech"],
+                                 sampling_rate=16000,
+                                 return_tensors="pt").input_values.to(device)
+        with torch.no_grad():
+            logits = ctc_model(input_values).logits
+        predicted_ids = torch.argmax(logits, dim=-1).squeeze()
+        # get feature
+        model_output = model(input_values, output_hidden_states=True)
+        feature = model_output.extract_features.squeeze()
+        last_hidden_state = model_output.last_hidden_state.squeeze()
+
+        predicted_ids_list.append(predicted_ids)
+        last_hidden_states_list.append(last_hidden_state)
+
+    # decode
+    predicted_ids_list = list()
+    last_hidden_states_list = list()
+
     librispeech_ds = load_dataset(data, "clean", split="validation")
     librispeech_ds = librispeech_ds.map(map_to_array)
+    result = librispeech_ds.map(map_to_result)
 
-    input_values = processor(librispeech_ds["speech"], sampling_rate=16000,
-                             return_tensors="pt").input_values
 
-    # get feature
-    model_output = model(input_values, output_hidden_states=True)
-    features = model_output.extract_features.squeeze()
-    last_hidden_states = model_output.last_hidden_state.squeeze()
-    print(features.shape)
-    print(last_hidden_states.shape)
-
-    # get label
-    logits = ctc_model(input_values).logits
-    print(logits.shape)
-    predicted_ids = torch.argmax(logits, dim=-1).squeeze()
-    print(processor.decode(predicted_ids))
+    predicted_ids = torch.cat(predicted_ids_list)
+    last_hidden_states = torch.cat(last_hidden_states_list)
 
     num_features, feature_size = last_hidden_states.shape
     num_ids = predicted_ids.shape[0]
